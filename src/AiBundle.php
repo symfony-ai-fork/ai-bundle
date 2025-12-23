@@ -176,7 +176,7 @@ final class AiBundle extends AbstractBundle
                     ->setDecoratedService($platform)
                     ->setArguments([new Reference('.inner')])
                     ->addTag('ai.traceable_platform');
-                $suffix = u($platform)->afterLast('.')->toString();
+                $suffix = u($platform)->after('ai.platform.')->toString();
                 $builder->setDefinition('ai.traceable_platform.'.$suffix, $traceablePlatformDefinition);
             }
         }
@@ -1519,12 +1519,13 @@ final class AiBundle extends AbstractBundle
             foreach ($stores as $name => $store) {
                 $arguments = [
                     new Reference($store['client']),
+                    $store['index_name'],
                     $store['namespace'] ?? $name,
                     $store['filter'],
                 ];
 
                 if (\array_key_exists('top_k', $store)) {
-                    $arguments[3] = $store['top_k'];
+                    $arguments[4] = $store['top_k'];
                 }
 
                 $definition = new Definition(PineconeStore::class);
@@ -1532,6 +1533,7 @@ final class AiBundle extends AbstractBundle
                     ->setLazy(true)
                     ->setArguments($arguments)
                     ->addTag('proxy', ['interface' => StoreInterface::class])
+                    ->addTag('proxy', ['interface' => ManagedStoreInterface::class])
                     ->addTag('ai.store');
 
                 $container->setDefinition('ai.store.'.$type.'.'.$name, $definition);
@@ -1836,7 +1838,6 @@ final class AiBundle extends AbstractBundle
                 $definition
                     ->setLazy(true)
                     ->setArguments([
-                        $dbalMessageStore['connection'],
                         $dbalMessageStore['table_name'] ?? $name,
                         new Reference(\sprintf('doctrine.dbal.%s_connection', $dbalMessageStore['connection'])),
                         new Reference('serializer'),

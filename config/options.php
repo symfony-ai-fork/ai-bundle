@@ -800,6 +800,7 @@ return static function (DefinitionConfigurator $configurator): void {
                                     ->cannotBeEmpty()
                                     ->defaultValue(PineconeClient::class)
                                 ->end()
+                                ->scalarNode('index_name')->isRequired()->end()
                                 ->scalarNode('namespace')->end()
                                 ->arrayNode('filter')
                                     ->scalarPrototype()
