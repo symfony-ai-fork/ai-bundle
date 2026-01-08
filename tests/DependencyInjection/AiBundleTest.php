@@ -11,6 +11,7 @@
 
 namespace Symfony\AI\AiBundle\Tests\DependencyInjection;
 
+use AsyncAws\BedrockRuntime\BedrockRuntimeClient;
 use Codewithkyrian\ChromaDB\Client;
 use MongoDB\Client as MongoDbClient;
 use PHPUnit\Framework\Attributes\DoesNotPerformAssertions;
@@ -18,6 +19,8 @@ use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use Probots\Pinecone\Client as PineconeClient;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 use Symfony\AI\Agent\AgentInterface;
 use Symfony\AI\Agent\Memory\MemoryInputProcessor;
 use Symfony\AI\Agent\Memory\StaticMemoryProvider;
@@ -31,6 +34,8 @@ use Symfony\AI\Platform\Bridge\Decart\PlatformFactory as DecartPlatformFactory;
 use Symfony\AI\Platform\Bridge\ElevenLabs\ElevenLabsApiCatalog;
 use Symfony\AI\Platform\Bridge\ElevenLabs\ModelCatalog as ElevenLabsModelCatalog;
 use Symfony\AI\Platform\Bridge\ElevenLabs\PlatformFactory as ElevenLabsPlatformFactory;
+use Symfony\AI\Platform\Bridge\Failover\FailoverPlatform;
+use Symfony\AI\Platform\Bridge\Failover\FailoverPlatformFactory;
 use Symfony\AI\Platform\Bridge\Ollama\OllamaApiCatalog;
 use Symfony\AI\Platform\CachedPlatform;
 use Symfony\AI\Platform\Capability;
@@ -84,6 +89,8 @@ use Symfony\Component\DependencyInjection\Definition;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\HttpClient\HttpClient;
+use Symfony\Component\RateLimiter\RateLimiterFactory;
+use Symfony\Component\RateLimiter\Storage\InMemoryStorage;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 class AiBundleTest extends TestCase
@@ -92,9 +99,9 @@ class AiBundleTest extends TestCase
     {
         $container = $this->buildContainer($this->getFullConfig());
 
-        // Mock services that are used as platform create arguments, but should not be testet here or are not available.
+        // Mock services that are used as platform create arguments, but should not be tested here or are not available.
         $container->set('event_dispatcher', $this->createMock(EventDispatcherInterface::class));
-        $container->getDefinition('ai.platform.vertexai')->replaceArgument(2, $this->createMock(HttpClientInterface::class));
+        $container->getDefinition('ai.platform.vertexai')->replaceArgument(3, $this->createMock(HttpClientInterface::class));
 
         $platforms = $container->findTaggedServiceIds('ai.platform');
 
@@ -224,7 +231,7 @@ class AiBundleTest extends TestCase
         ]);
 
         $this->assertTrue($container->hasAlias(AgentInterface::class));
-        $this->assertTrue($container->hasAlias(AgentInterface::class.' $myAgentAgent'));
+        $this->assertTrue($container->hasAlias(AgentInterface::class.' $myAgent'));
     }
 
     public function testInjectionStoreAliasIsRegistered()
@@ -3947,6 +3954,62 @@ class AiBundleTest extends TestCase
         $this->assertSame([['interface' => ModelCatalogInterface::class]], $modelCatalogDefinition->getTag('proxy'));
     }
 
+    public function testFailoverPlatformCanBeCreated()
+    {
+        $container = $this->buildContainer([
+            'ai' => [
+                'platform' => [
+                    'ollama' => [
+                        'host_url' => 'http://127.0.0.1:11434',
+                    ],
+                    'openai' => [
+                        'api_key' => 'sk-openai_key_full',
+                    ],
+                    'failover' => [
+                        'main' => [
+                            'platforms' => [
+                                'ai.platform.ollama',
+                                'ai.platform.openai',
+                            ],
+                            'rate_limiter' => 'limiter.failover_platform',
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $this->assertTrue($container->hasDefinition('ai.platform.failover.main'));
+
+        $definition = $container->getDefinition('ai.platform.failover.main');
+
+        $this->assertSame([
+            FailoverPlatformFactory::class,
+            'create',
+        ], $definition->getFactory());
+        $this->assertTrue($definition->isLazy());
+        $this->assertSame(FailoverPlatform::class, $definition->getClass());
+
+        $this->assertCount(4, $definition->getArguments());
+        $this->assertCount(2, $definition->getArgument(0));
+        $this->assertEquals([
+            new Reference('ai.platform.ollama'),
+            new Reference('ai.platform.openai'),
+        ], $definition->getArgument(0));
+        $this->assertInstanceOf(Reference::class, $definition->getArgument(1));
+        $this->assertSame('limiter.failover_platform', (string) $definition->getArgument(1));
+        $this->assertInstanceOf(Reference::class, $definition->getArgument(2));
+        $this->assertSame(ClockInterface::class, (string) $definition->getArgument(2));
+        $this->assertInstanceOf(Reference::class, $definition->getArgument(3));
+        $this->assertSame(LoggerInterface::class, (string) $definition->getArgument(3));
+
+        $this->assertTrue($definition->hasTag('proxy'));
+        $this->assertSame([['interface' => PlatformInterface::class]], $definition->getTag('proxy'));
+        $this->assertTrue($definition->hasTag('ai.platform'));
+        $this->assertSame([['name' => 'failover']], $definition->getTag('ai.platform'));
+
+        $this->assertTrue($container->hasAlias('Symfony\AI\Platform\PlatformInterface $main'));
+    }
+
     public function testOpenAiPlatformWithDefaultRegion()
     {
         $container = $this->buildContainer([
@@ -4037,6 +4100,28 @@ class AiBundleTest extends TestCase
         $this->assertSame('ai.platform.model_catalog.perplexity', (string) $arguments[2]);
         $this->assertInstanceOf(Reference::class, $arguments[3]);
         $this->assertSame('ai.platform.contract.perplexity', (string) $arguments[3]);
+    }
+
+    public function testTransformersPhpConfiguration()
+    {
+        $container = $this->buildContainer([
+            'ai' => [
+                'platform' => [
+                    'transformersphp' => [],
+                ],
+            ],
+        ]);
+
+        $this->assertTrue($container->hasDefinition('ai.platform.transformersphp'));
+
+        $definition = $container->getDefinition('ai.platform.transformersphp');
+        $arguments = $definition->getArguments();
+
+        $this->assertCount(2, $arguments);
+        $this->assertInstanceOf(Reference::class, $arguments[0]);
+        $this->assertSame('ai.platform.model_catalog.transformersphp', (string) $arguments[0]);
+        $this->assertInstanceOf(Reference::class, $arguments[1]);
+        $this->assertSame('event_dispatcher', (string) $arguments[1]);
     }
 
     #[TestDox('System prompt with array structure works correctly')]
@@ -4285,8 +4370,8 @@ class AiBundleTest extends TestCase
         $arguments = $definition->getArguments();
 
         // Check that the memory processor references the static memory provider
-        $this->assertInstanceOf(Reference::class, $arguments[0]);
-        $this->assertSame('ai.agent.test_agent.static_memory_provider', (string) $arguments[0]);
+        $this->assertInstanceOf(Reference::class, $arguments[0][0]);
+        $this->assertSame('ai.agent.test_agent.static_memory_provider', (string) $arguments[0][0]);
 
         // Check that the processor has the correct tags with proper priority
         $tags = $definition->getTag('ai.agent.input_processor');
@@ -4364,8 +4449,8 @@ class AiBundleTest extends TestCase
         $this->assertTrue($container->hasDefinition('ai.agent.test_agent.static_memory_provider'));
         $memoryDefinition = $container->getDefinition('ai.agent.test_agent.memory_input_processor');
         $memoryArguments = $memoryDefinition->getArguments();
-        $this->assertInstanceOf(Reference::class, $memoryArguments[0]);
-        $this->assertSame('ai.agent.test_agent.static_memory_provider', (string) $memoryArguments[0]);
+        $this->assertInstanceOf(Reference::class, $memoryArguments[0][0]);
+        $this->assertSame('ai.agent.test_agent.static_memory_provider', (string) $memoryArguments[0][0]);
 
         // Verify memory processor has highest priority (runs first)
         $memoryTags = $memoryDefinition->getTag('ai.agent.input_processor');
@@ -4434,7 +4519,7 @@ class AiBundleTest extends TestCase
         $this->assertTrue($container->hasDefinition('ai.agent.agent_with_memory.static_memory_provider'));
         $firstMemoryDef = $container->getDefinition('ai.agent.agent_with_memory.memory_input_processor');
         $firstMemoryArgs = $firstMemoryDef->getArguments();
-        $this->assertSame('ai.agent.agent_with_memory.static_memory_provider', (string) $firstMemoryArgs[0]);
+        $this->assertSame('ai.agent.agent_with_memory.static_memory_provider', (string) $firstMemoryArgs[0][0]);
 
         // Second agent should not have memory processor
         $this->assertFalse($container->hasDefinition('ai.agent.agent_without_memory.memory_input_processor'));
@@ -4444,7 +4529,7 @@ class AiBundleTest extends TestCase
         $this->assertTrue($container->hasDefinition('ai.agent.agent_with_different_memory.static_memory_provider'));
         $thirdMemoryDef = $container->getDefinition('ai.agent.agent_with_different_memory.memory_input_processor');
         $thirdMemoryArgs = $thirdMemoryDef->getArguments();
-        $this->assertSame('ai.agent.agent_with_different_memory.static_memory_provider', (string) $thirdMemoryArgs[0]);
+        $this->assertSame('ai.agent.agent_with_different_memory.static_memory_provider', (string) $thirdMemoryArgs[0][0]);
 
         // Verify that each memory processor is tagged for the correct agent
         $firstTags = $firstMemoryDef->getTag('ai.agent.input_processor');
@@ -4575,8 +4660,8 @@ class AiBundleTest extends TestCase
 
         $memoryProcessor = $container->getDefinition('ai.agent.test_agent.memory_input_processor');
         $arguments = $memoryProcessor->getArguments();
-        $this->assertInstanceOf(Reference::class, $arguments[0]);
-        $this->assertSame('my_custom_memory_service', (string) $arguments[0]);
+        $this->assertInstanceOf(Reference::class, $arguments[0][0]);
+        $this->assertSame('my_custom_memory_service', (string) $arguments[0][0]);
     }
 
     #[TestDox('Memory configuration preserves correct processor priority ordering')]
@@ -4635,8 +4720,8 @@ class AiBundleTest extends TestCase
         $this->assertTrue($container->hasDefinition('ai.agent.test_agent.static_memory_provider'));
         $arguments = $definition->getArguments();
         $this->assertCount(1, $arguments);
-        $this->assertInstanceOf(Reference::class, $arguments[0]);
-        $this->assertSame('ai.agent.test_agent.static_memory_provider', (string) $arguments[0]);
+        $this->assertInstanceOf(Reference::class, $arguments[0][0]);
+        $this->assertSame('ai.agent.test_agent.static_memory_provider', (string) $arguments[0][0]);
 
         // Check proper tagging
         $tags = $definition->getTag('ai.agent.input_processor');
@@ -4678,8 +4763,8 @@ class AiBundleTest extends TestCase
 
         $memoryProcessor = $container->getDefinition('ai.agent.test_agent.memory_input_processor');
         $arguments = $memoryProcessor->getArguments();
-        $this->assertInstanceOf(Reference::class, $arguments[0]);
-        $this->assertSame('existing_memory_service', (string) $arguments[0]);
+        $this->assertInstanceOf(Reference::class, $arguments[0][0]);
+        $this->assertSame('existing_memory_service', (string) $arguments[0][0]);
     }
 
     #[TestDox('Memory with non-existing service creates StaticMemoryProvider')]
@@ -4712,8 +4797,8 @@ class AiBundleTest extends TestCase
         // Check that memory processor uses the StaticMemoryProvider
         $memoryProcessor = $container->getDefinition('ai.agent.test_agent.memory_input_processor');
         $memoryProcessorArgs = $memoryProcessor->getArguments();
-        $this->assertInstanceOf(Reference::class, $memoryProcessorArgs[0]);
-        $this->assertSame('ai.agent.test_agent.static_memory_provider', (string) $memoryProcessorArgs[0]);
+        $this->assertInstanceOf(Reference::class, $memoryProcessorArgs[0][0]);
+        $this->assertSame('ai.agent.test_agent.static_memory_provider', (string) $memoryProcessorArgs[0][0]);
     }
 
     #[TestDox('Memory with service alias uses alias correctly')]
@@ -4750,8 +4835,8 @@ class AiBundleTest extends TestCase
 
         $memoryProcessor = $container->getDefinition('ai.agent.test_agent.memory_input_processor');
         $arguments = $memoryProcessor->getArguments();
-        $this->assertInstanceOf(Reference::class, $arguments[0]);
-        $this->assertSame('memory_alias', (string) $arguments[0]);
+        $this->assertInstanceOf(Reference::class, $arguments[0][0]);
+        $this->assertSame('memory_alias', (string) $arguments[0][0]);
     }
 
     #[TestDox('Different agents can use different memory types')]
@@ -4793,8 +4878,8 @@ class AiBundleTest extends TestCase
 
         $serviceMemoryProcessor = $container->getDefinition('ai.agent.agent_with_service.memory_input_processor');
         $serviceArgs = $serviceMemoryProcessor->getArguments();
-        $this->assertInstanceOf(Reference::class, $serviceArgs[0]);
-        $this->assertSame('dynamic_memory_service', (string) $serviceArgs[0]);
+        $this->assertInstanceOf(Reference::class, $serviceArgs[0][0]);
+        $this->assertSame('dynamic_memory_service', (string) $serviceArgs[0][0]);
 
         // Second agent uses StaticMemoryProvider
         $this->assertTrue($container->hasDefinition('ai.agent.agent_with_static.memory_input_processor'));
@@ -5672,7 +5757,7 @@ class AiBundleTest extends TestCase
         $this->assertSame([['name' => 'support']], $tags['ai.agent']);
 
         // Verify alias is created
-        $this->assertTrue($container->hasAlias('Symfony\AI\Agent\AgentInterface $supportMultiAgent'));
+        $this->assertTrue($container->hasAlias('Symfony\AI\Agent\AgentInterface $support'));
     }
 
     public function testMultiAgentWithMultipleHandoffs()
@@ -5997,8 +6082,8 @@ class AiBundleTest extends TestCase
         $this->assertArrayHasKey('ai.agent', $csTags);
         $this->assertSame([['name' => 'customer_support']], $csTags['ai.agent']);
 
-        $this->assertTrue($container->hasAlias('Symfony\AI\Agent\AgentInterface $customerSupportMultiAgent'));
-        $this->assertTrue($container->hasAlias('Symfony\AI\Agent\AgentInterface $developmentAssistantMultiAgent'));
+        $this->assertTrue($container->hasAlias('Symfony\AI\Agent\AgentInterface $customerSupport'));
+        $this->assertTrue($container->hasAlias('Symfony\AI\Agent\AgentInterface $developmentAssistant'));
 
         // Test development_assistant multi-agent configuration
         $devAssistantDef = $container->getDefinition('ai.multi_agent.development_assistant');
@@ -6874,6 +6959,40 @@ class AiBundleTest extends TestCase
         $this->assertArrayHasKey('my-custom-vertex-model', $arguments[0]);
     }
 
+    #[TestDox('VertexAI platform uses custom http_client when configured')]
+    public function testVertexAiPlatformUsesCustomHttpClient()
+    {
+        $container = $this->buildContainer([
+            'ai' => [
+                'platform' => [
+                    'vertexai' => [
+                        'location' => 'us-central1',
+                        'project_id' => 'my-project',
+                        'http_client' => 'my_custom_http_client',
+                    ],
+                ],
+            ],
+        ]);
+
+        $this->assertTrue($container->hasDefinition('ai.platform.vertexai'));
+
+        $definition = $container->getDefinition('ai.platform.vertexai');
+        $arguments = $definition->getArguments();
+
+        $this->assertSame('us-central1', $arguments[0]);
+        $this->assertSame('my-project', $arguments[1]);
+
+        // Argument 2 is the http client definition which uses the configured http_client service
+        $httpClientDefinition = $arguments[3];
+        $this->assertInstanceOf(Definition::class, $httpClientDefinition);
+
+        $factory = $httpClientDefinition->getFactory();
+        $this->assertIsArray($factory);
+        $this->assertInstanceOf(Reference::class, $factory[0]);
+        $this->assertSame('my_custom_http_client', (string) $factory[0]);
+        $this->assertSame('withOptions', $factory[1]);
+    }
+
     #[TestDox('Model configuration is ignored for unknown platform')]
     public function testModelConfigurationIsIgnoredForUnknownPlatform()
     {
@@ -7028,6 +7147,17 @@ class AiBundleTest extends TestCase
         $container->setParameter('kernel.environment', 'dev');
         $container->setParameter('kernel.build_dir', 'public');
         $container->setDefinition(ClockInterface::class, new Definition(MonotonicClock::class));
+        $container->setDefinition('async_aws.client.bedrock_us', new Definition(BedrockRuntimeClient::class));
+        $container->setDefinition(LoggerInterface::class, new Definition(NullLogger::class));
+        $container->setDefinition('limiter.failover_platform', new Definition(RateLimiterFactory::class, [
+            [
+                'policy' => 'sliding_window',
+                'id' => 'test',
+                'interval' => '60 seconds',
+                'limit' => 1,
+            ],
+            new Definition(InMemoryStorage::class),
+        ]));
 
         $extension = (new AiBundle())->getContainerExtension();
         $extension->load($configuration, $container);
@@ -7064,6 +7194,12 @@ class AiBundleTest extends TestCase
                             'api_version' => '2024-02-15-preview',
                         ],
                     ],
+                    'bedrock' => [
+                        'default' => [],
+                        'us' => [
+                            'bedrock_runtime_client' => 'async_aws.client.bedrock_us',
+                        ],
+                    ],
                     'cache' => [
                         'azure' => [
                             'platform' => 'ai.platform.azure.my_azure_instance',
@@ -7082,6 +7218,15 @@ class AiBundleTest extends TestCase
                     'elevenlabs' => [
                         'host' => 'https://api.elevenlabs.io/v1',
                         'api_key' => 'elevenlabs_key_full',
+                    ],
+                    'failover' => [
+                        'main' => [
+                            'platforms' => [
+                                'ai.platform.ollama',
+                                'ai.platform.openai',
+                            ],
+                            'rate_limiter' => 'limiter.failover_platform',
+                        ],
                     ],
                     'gemini' => [
                         'api_key' => 'gemini_key_full',
@@ -7110,10 +7255,12 @@ class AiBundleTest extends TestCase
                     'vertexai' => [
                         'location' => 'global',
                         'project_id' => '123',
+                        'api_key' => 'vertex_key_full',
                     ],
                     'dockermodelrunner' => [
                         'host_url' => 'http://127.0.0.1:12434',
                     ],
+                    'transformersphp' => [],
                 ],
                 'agent' => [
                     'my_chat_agent' => [

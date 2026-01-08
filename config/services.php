@@ -29,6 +29,7 @@ use Symfony\AI\Platform\Bridge\Albert\ModelCatalog as AlbertModelCatalog;
 use Symfony\AI\Platform\Bridge\Anthropic\Contract\AnthropicContract;
 use Symfony\AI\Platform\Bridge\Anthropic\ModelCatalog as AnthropicModelCatalog;
 use Symfony\AI\Platform\Bridge\Azure\OpenAi\ModelCatalog as AzureOpenAiModelCatalog;
+use Symfony\AI\Platform\Bridge\Bedrock\ModelCatalog as BedrockModelCatalog;
 use Symfony\AI\Platform\Bridge\Cartesia\ModelCatalog as CartesiaModelCatalog;
 use Symfony\AI\Platform\Bridge\Cerebras\ModelCatalog as CerebrasModelCatalog;
 use Symfony\AI\Platform\Bridge\Decart\ModelCatalog as DecartModelCatalog;
@@ -51,6 +52,7 @@ use Symfony\AI\Platform\Bridge\Perplexity\Contract\PerplexityContract;
 use Symfony\AI\Platform\Bridge\Perplexity\ModelCatalog as PerplexityModelCatalog;
 use Symfony\AI\Platform\Bridge\Replicate\ModelCatalog as ReplicateModelCatalog;
 use Symfony\AI\Platform\Bridge\Scaleway\ModelCatalog as ScalewayModelCatalog;
+use Symfony\AI\Platform\Bridge\TransformersPhp\ModelCatalog as TransformersPhpModelCatalog;
 use Symfony\AI\Platform\Bridge\VertexAi\Contract\GeminiContract as VertexAiGeminiContract;
 use Symfony\AI\Platform\Bridge\VertexAi\ModelCatalog as VertexAiModelCatalog;
 use Symfony\AI\Platform\Bridge\Voyage\ModelCatalog as VoyageModelCatalog;
@@ -95,6 +97,7 @@ return static function (ContainerConfigurator $container): void {
         ->set('ai.platform.model_catalog.albert', AlbertModelCatalog::class)
         ->set('ai.platform.model_catalog.anthropic', AnthropicModelCatalog::class)
         ->set('ai.platform.model_catalog.azure.openai', AzureOpenAiModelCatalog::class)
+        ->set('ai.platform.model_catalog.bedrock', BedrockModelCatalog::class)
         ->set('ai.platform.model_catalog.cartesia', CartesiaModelCatalog::class)
         ->set('ai.platform.model_catalog.cerebras', CerebrasModelCatalog::class)
         ->set('ai.platform.model_catalog.decart', DecartModelCatalog::class)
@@ -116,6 +119,7 @@ return static function (ContainerConfigurator $container): void {
         ->set('ai.platform.model_catalog.scaleway', ScalewayModelCatalog::class)
         ->set('ai.platform.model_catalog.vertexai.gemini', VertexAiModelCatalog::class)
         ->set('ai.platform.model_catalog.voyage', VoyageModelCatalog::class)
+        ->set('ai.platform.model_catalog.transformersphp', TransformersPhpModelCatalog::class)
 
         // message templates
         ->set('ai.platform.template_renderer.string', StringTemplateRenderer::class)

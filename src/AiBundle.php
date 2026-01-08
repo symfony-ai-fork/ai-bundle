@@ -13,6 +13,7 @@ namespace Symfony\AI\AiBundle;
 
 use Google\Auth\ApplicationDefaultCredentials;
 use Google\Auth\FetchAuthTokenInterface;
+use Psr\Log\LoggerInterface;
 use Symfony\AI\Agent\Agent;
 use Symfony\AI\Agent\AgentInterface;
 use Symfony\AI\Agent\Attribute\AsInputProcessor;
@@ -53,6 +54,7 @@ use Symfony\AI\Chat\MessageStoreInterface;
 use Symfony\AI\Platform\Bridge\Albert\PlatformFactory as AlbertPlatformFactory;
 use Symfony\AI\Platform\Bridge\Anthropic\PlatformFactory as AnthropicPlatformFactory;
 use Symfony\AI\Platform\Bridge\Azure\OpenAi\PlatformFactory as AzureOpenAiPlatformFactory;
+use Symfony\AI\Platform\Bridge\Bedrock\PlatformFactory as BedrockFactory;
 use Symfony\AI\Platform\Bridge\Cartesia\PlatformFactory as CartesiaPlatformFactory;
 use Symfony\AI\Platform\Bridge\Cerebras\PlatformFactory as CerebrasPlatformFactory;
 use Symfony\AI\Platform\Bridge\Decart\PlatformFactory as DecartPlatformFactory;
@@ -60,6 +62,8 @@ use Symfony\AI\Platform\Bridge\DeepSeek\PlatformFactory as DeepSeekPlatformFacto
 use Symfony\AI\Platform\Bridge\DockerModelRunner\PlatformFactory as DockerModelRunnerPlatformFactory;
 use Symfony\AI\Platform\Bridge\ElevenLabs\ElevenLabsApiCatalog;
 use Symfony\AI\Platform\Bridge\ElevenLabs\PlatformFactory as ElevenLabsPlatformFactory;
+use Symfony\AI\Platform\Bridge\Failover\FailoverPlatform;
+use Symfony\AI\Platform\Bridge\Failover\FailoverPlatformFactory;
 use Symfony\AI\Platform\Bridge\Gemini\PlatformFactory as GeminiPlatformFactory;
 use Symfony\AI\Platform\Bridge\Generic\PlatformFactory as GenericPlatformFactory;
 use Symfony\AI\Platform\Bridge\HuggingFace\PlatformFactory as HuggingFacePlatformFactory;
@@ -71,6 +75,7 @@ use Symfony\AI\Platform\Bridge\OpenAi\PlatformFactory as OpenAiPlatformFactory;
 use Symfony\AI\Platform\Bridge\OpenRouter\PlatformFactory as OpenRouterPlatformFactory;
 use Symfony\AI\Platform\Bridge\Perplexity\PlatformFactory as PerplexityPlatformFactory;
 use Symfony\AI\Platform\Bridge\Scaleway\PlatformFactory as ScalewayPlatformFactory;
+use Symfony\AI\Platform\Bridge\TransformersPhp\PlatformFactory as TransformersPhpPlatformFactory;
 use Symfony\AI\Platform\Bridge\VertexAi\PlatformFactory as VertexAiPlatformFactory;
 use Symfony\AI\Platform\Bridge\Voyage\PlatformFactory as VoyagePlatformFactory;
 use Symfony\AI\Platform\CachedPlatform;
@@ -206,7 +211,8 @@ final class AiBundle extends AbstractBundle
 
         $setupStoresOptions = [];
         if ([] !== ($config['store'] ?? [])) {
-            if (!ContainerBuilder::willBeAvailable('symfony/ai-store', StoreInterface::class, ['symfony/ai-bundle'])) {
+            $storeConfigured = \count($config['store']) !== \count($config['store'], \COUNT_RECURSIVE);
+            if ($storeConfigured && !ContainerBuilder::willBeAvailable('symfony/ai-store', StoreInterface::class, ['symfony/ai-bundle'])) {
                 throw new RuntimeException('Store configuration requires "symfony/ai-store" package. Try running "composer require symfony/ai-store".');
             }
 
@@ -482,6 +488,31 @@ final class AiBundle extends AbstractBundle
             return;
         }
 
+        if ('bedrock' === $type) {
+            foreach ($platform as $name => $config) {
+                if (!ContainerBuilder::willBeAvailable('symfony/ai-bedrock-platform', BedrockFactory::class, ['symfony/ai-bundle'])) {
+                    throw new RuntimeException('Bedrock platform configuration requires "symfony/ai-bedrock-platform" package. Try running "composer require symfony/ai-bedrock-platform".');
+                }
+
+                $platformId = 'ai.platform.bedrock.'.$name;
+                $definition = (new Definition(Platform::class))
+                    ->setFactory(BedrockFactory::class.'::create')
+                    ->setLazy(true)
+                    ->addTag('proxy', ['interface' => PlatformInterface::class])
+                    ->setArguments([
+                        $config['bedrock_runtime_client'] ? new Reference($config['bedrock_runtime_client'], ContainerInterface::NULL_ON_INVALID_REFERENCE) : null,
+                        $config['model_catalog'] ? new Reference($config['model_catalog']) : new Reference('ai.platform.model_catalog.bedrock'),
+                        null,
+                        new Reference('event_dispatcher'),
+                    ])
+                    ->addTag('ai.platform', ['name' => 'bedrock.'.$name]);
+
+                $container->setDefinition($platformId, $definition);
+            }
+
+            return;
+        }
+
         if ('cache' === $type) {
             foreach ($platform as $name => $cachedPlatformConfig) {
                 $definition = (new Definition(CachedPlatform::class))
@@ -585,6 +616,34 @@ final class AiBundle extends AbstractBundle
             return;
         }
 
+        if ('failover' === $type) {
+            foreach ($platform as $name => $config) {
+                if (!ContainerBuilder::willBeAvailable('symfony/ai-failover-platform', FailoverPlatformFactory::class, ['symfony/ai-bundle'])) {
+                    throw new RuntimeException('Failover platform configuration requires "symfony/ai-failover-platform" package. Try running "composer require symfony/ai-failover-platform".');
+                }
+
+                $definition = (new Definition(FailoverPlatform::class))
+                    ->setFactory(FailoverPlatformFactory::class.'::create')
+                    ->setLazy(true)
+                    ->setArguments([
+                        array_map(
+                            static fn (string $wrappedPlatform): Reference => new Reference($wrappedPlatform),
+                            $config['platforms'],
+                        ),
+                        new Reference($config['rate_limiter']),
+                        new Reference(ClockInterface::class),
+                        new Reference(LoggerInterface::class),
+                    ])
+                    ->addTag('proxy', ['interface' => PlatformInterface::class])
+                    ->addTag('ai.platform', ['name' => $type]);
+
+                $container->setDefinition('ai.platform.'.$type.'.'.$name, $definition);
+                $container->registerAliasForArgument('ai.platform.'.$type.'.'.$name, PlatformInterface::class, $name);
+            }
+
+            return;
+        }
+
         if ('gemini' === $type) {
             if (!ContainerBuilder::willBeAvailable('symfony/ai-gemini-platform', GeminiPlatformFactory::class, ['symfony/ai-bundle'])) {
                 throw new RuntimeException('Gemini platform configuration requires "symfony/ai-gemini-platform" package. Try running "composer require symfony/ai-gemini-platform".');
@@ -684,7 +743,7 @@ final class AiBundle extends AbstractBundle
             $credentialsObject = new Definition(\ArrayObject::class, [(new Definition('array'))->setFactory([$credentials, 'fetchAuthToken'])]);
 
             $httpClient = (new Definition(HttpClientInterface::class))
-                ->setFactory([HttpClient::class, 'create'])
+                ->setFactory([new Reference($platform['http_client'], ContainerInterface::NULL_ON_INVALID_REFERENCE), 'withOptions'])
                 ->setArgument(0, [
                     'auth_bearer' => (new Definition('string', ['access_token']))->setFactory([$credentialsObject, 'offsetGet']),
                 ])
@@ -698,6 +757,7 @@ final class AiBundle extends AbstractBundle
                 ->setArguments([
                     $platform['location'],
                     $platform['project_id'],
+                    $platform['api_key'] ?? null,
                     $httpClient,
                     new Reference('ai.platform.model_catalog.vertexai.gemini'),
                     new Reference('ai.platform.contract.vertexai.gemini'),
@@ -987,6 +1047,27 @@ final class AiBundle extends AbstractBundle
             return;
         }
 
+        if ('transformersphp' === $type) {
+            if (!ContainerBuilder::willBeAvailable('symfony/ai-transformers-php-platform', TransformersPhpPlatformFactory::class, ['symfony/ai-bundle'])) {
+                throw new RuntimeException('TransformersPhp platform configuration requires "symfony/ai-transformers-php-platform" package. Try running "composer require symfony/ai-transformers-php-platform".');
+            }
+
+            $platformId = 'ai.platform.transformersphp';
+            $definition = (new Definition(Platform::class))
+                ->setFactory(TransformersPhpPlatformFactory::class.'::create')
+                ->setLazy(true)
+                ->addTag('proxy', ['interface' => PlatformInterface::class])
+                ->setArguments([
+                    new Reference('ai.platform.model_catalog.transformersphp'),
+                    new Reference('event_dispatcher'),
+                ])
+                ->addTag('ai.platform');
+
+            $container->setDefinition($platformId, $definition);
+
+            return;
+        }
+
         throw new InvalidArgumentException(\sprintf('Platform "%s" is not supported for configuration via bundle at this point.', $type));
     }
 
@@ -1130,7 +1211,7 @@ final class AiBundle extends AbstractBundle
             }
 
             $memoryInputProcessorDefinition = (new Definition(MemoryInputProcessor::class))
-                ->setArguments([$memoryProviderReference])
+                ->setArguments([[$memoryProviderReference]])
                 ->addTag('ai.agent.input_processor', ['agent' => $agentId, 'priority' => -40]);
 
             $container->setDefinition('ai.agent.'.$name.'.memory_input_processor', $memoryInputProcessorDefinition);
@@ -1144,7 +1225,7 @@ final class AiBundle extends AbstractBundle
         ;
 
         $container->setDefinition($agentId, $agentDefinition);
-        $container->registerAliasForArgument($agentId, AgentInterface::class, (new Target($name.'Agent'))->getParsedName());
+        $container->registerAliasForArgument($agentId, AgentInterface::class, (new Target($name))->getParsedName());
     }
 
     /**
@@ -2201,7 +2282,7 @@ final class AiBundle extends AbstractBundle
         $multiAgentDefinition->addTag('ai.agent', ['name' => $name]);
 
         $container->setDefinition($multiAgentId, $multiAgentDefinition);
-        $container->registerAliasForArgument($multiAgentId, AgentInterface::class, (new Target($name.'MultiAgent'))->getParsedName());
+        $container->registerAliasForArgument($multiAgentId, AgentInterface::class, (new Target($name))->getParsedName());
     }
 
     /**
